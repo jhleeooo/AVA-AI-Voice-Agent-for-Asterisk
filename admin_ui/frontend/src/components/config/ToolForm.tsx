@@ -1168,6 +1168,15 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 check_extension_status: { ...restCheckExtensionStatus, state_mapping: next },
             });
         }
+
+        // Reflect the dedup result in all three drafts immediately rather than
+        // waiting for the config prop to round-trip back through the parent and
+        // re-sync via the stateMapping*Text effects — that extra render cycle is
+        // a race under real timing (parent re-render delay, debounced onChange),
+        // which let an edited bucket's dedup-cleared sibling flash its stale value.
+        setStateMappingFreeDraft(next.free.join(' '));
+        setStateMappingBusyDraft(next.busy.join(' '));
+        setStateMappingUnavailableDraft(next.unavailable.join(' '));
     };
 
     const resetStateMappingToDefaults = () => {
