@@ -659,6 +659,7 @@ class Engine:
         self._provider_output_operations: Dict[str, Dict[str, Any]] = {}
         self._agent_output_active_calls: Set[str] = set()
         self._provider_output_drain_tasks: Dict[str, asyncio.Task] = {}
+        self._deferred_transfer_commit_locks: Dict[str, asyncio.Lock] = {}
         # All terminal paths converge on one idempotent drain-and-hangup owner.
         self._terminal_hangup_locks: Dict[str, asyncio.Lock] = {}
         self._terminal_hangup_started: Set[str] = set()
@@ -670,6 +671,8 @@ class Engine:
         # A rejected scheduled-outbound channel needs the same independent
         # ownership when its fail-closed ARI DELETE is not accepted.
         self._outbound_forced_hangup_tasks: Dict[str, asyncio.Task] = {}
+        self._deferred_predial_forced_hangup_tasks: Dict[str, asyncio.Task] = {}
+        self._deferred_transfer_recovery_tasks: Dict[str, asyncio.Task] = {}
         # Local TTS farewells are a two-step exchange: execute hangup_call,
         # then wait for Local AI Server to synthesize the tool's farewell.
         # Keep that boundary separate from cleanup_after_tts so a stale
@@ -3942,9 +3945,15 @@ class Engine:
         sessions = await self.session_store.get_all_sessions()
         for session in sessions:
             await self._cleanup_call(session.call_id)
+        # A deferred transfer timeout can retain an answered predial leg under
+        # a retry owner after the call's current_action has been cleared. Make
+        # one final, result-checked ARI hangup attempt while the connection is
+        # still available instead of only cancelling that owner below.
+        await self._finalize_deferred_predial_hangups_for_shutdown()
         forced_hangup_tasks = [
             *getattr(self, "_vicidial_forced_hangup_tasks", {}).values(),
             *getattr(self, "_outbound_forced_hangup_tasks", {}).values(),
+            *getattr(self, "_deferred_predial_forced_hangup_tasks", {}).values(),
         ]
         for forced_hangup_task in forced_hangup_tasks:
             if not forced_hangup_task.done():
@@ -7705,7 +7714,7 @@ class Engine:
     async def _handle_unbridged_predial_transfer_channel_end(self, session: "CallSession", predial_channel_id: str) -> None:
         """Handle a predial destination leg ending before it is bridged to the caller."""
         call_id = session.call_id
-        self._unregister_predial_transfer_channel(predial_channel_id)
+        self._release_deferred_predial_hangup_ownership(predial_channel_id)
         try:
             latest = await self.session_store.get_by_call_id(call_id) or session
             action = dict(getattr(latest, "current_action", None) or {})
@@ -7725,6 +7734,59 @@ class Engine:
             predial_channel_id=predial_channel_id,
         )
 
+    def _release_deferred_predial_hangup_ownership(self, channel_id: str) -> None:
+        """Release mapping/retry ownership after ARI accepts hangup or reports 404."""
+        self._unregister_predial_transfer_channel(channel_id)
+        tasks = getattr(self, "_deferred_predial_forced_hangup_tasks", None) or {}
+        retry_task = tasks.pop(channel_id, None)
+        current_task = asyncio.current_task()
+        if retry_task and retry_task is not current_task and not retry_task.done():
+            retry_task.cancel()
+
+    def _schedule_deferred_predial_forced_hangup_retry(
+        self,
+        *,
+        call_id: str,
+        channel_id: str,
+    ) -> None:
+        """Retain a timed-out predial leg until ARI accepts its hangup."""
+        self._schedule_forced_hangup_retry_owner(
+            task_store_attribute="_deferred_predial_forced_hangup_tasks",
+            task_name_prefix="deferred-predial-forced-hangup",
+            log_subject="deferred predial",
+            log_context={"call_id": call_id},
+            attempt_log_field="retry_attempt",
+            channel_id=channel_id,
+            on_accepted=lambda: self._release_deferred_predial_hangup_ownership(
+                channel_id
+            ),
+        )
+
+    async def _finalize_deferred_predial_hangups_for_shutdown(self) -> None:
+        """Attempt retained predial hangups once more before ARI disconnects."""
+        tasks = getattr(self, "_deferred_predial_forced_hangup_tasks", None) or {}
+        for channel_id in tuple(tasks):
+            try:
+                accepted = bool(await self.ari_client.hangup_channel(channel_id))
+            except Exception:
+                accepted = False
+                logger.error(
+                    "Final deferred predial hangup raised during shutdown",
+                    predial_channel_id=channel_id,
+                    exc_info=True,
+                )
+            if accepted:
+                logger.info(
+                    "Final deferred predial hangup accepted during shutdown",
+                    predial_channel_id=channel_id,
+                )
+                self._release_deferred_predial_hangup_ownership(channel_id)
+            else:
+                logger.error(
+                    "Final deferred predial hangup was not accepted during shutdown",
+                    predial_channel_id=channel_id,
+                )
+
     async def _stop_provider_after_predial_bridge(self, call_id: str, provider: Any, provider_name: Optional[str]) -> None:
         try:
             await self._stop_call_provider_instance(call_id, provider, provider_name)
@@ -7735,6 +7797,39 @@ class Engine:
         """Register an attended transfer agent channel to resolve DTMF events back to a call."""
         if agent_channel_id:
             self._attended_transfer_agent_channel_to_call_id[agent_channel_id] = call_id
+
+    def _activate_attended_transfer_answered_channel(
+        self, call_id: str, agent_channel_id: str
+    ) -> tuple[str, ...]:
+        """Make the channel that entered Stasis the sole active transfer leg.
+
+        Asterisk/FreePBX call pickup answers an originated ringing channel on the
+        pickup phone's channel.  The original channel is then destroyed.  Keeping
+        both channels mapped to the call makes that expected teardown look like
+        the active destination hung up, which triggers full caller cleanup.
+
+        This replacement is deliberately synchronous so ownership changes before
+        this StasisStart handler performs any await.  Screening and DTMF acceptance
+        continue on ``agent_channel_id`` exactly as they do for a direct answer.
+        """
+        superseded = tuple(
+            channel_id
+            for channel_id, mapped_call_id in list(
+                self._attended_transfer_agent_channel_to_call_id.items()
+            )
+            if mapped_call_id == call_id and channel_id != agent_channel_id
+        )
+        self.register_attended_transfer_agent_channel(call_id, agent_channel_id)
+        for channel_id in superseded:
+            self._unregister_attended_transfer_agent_channel(channel_id)
+        if superseded:
+            logger.info(
+                "Attended transfer ownership moved to answered channel",
+                call_id=call_id,
+                agent_channel_id=agent_channel_id,
+                superseded_agent_channel_ids=list(superseded),
+            )
+        return superseded
 
     def start_attended_transfer_timeout_guard(self, call_id: str, agent_channel_id: str, *, timeout_sec: float) -> None:
         """Ensure MOH/action state is cleaned up if the agent leg never answers."""
@@ -8728,9 +8823,15 @@ class Engine:
             await self.ari_client.hangup_channel(channel_id)
             return
 
+        # FreePBX pickup can answer the originated ringing leg on a different
+        # PJSIP channel. Replace runtime ownership before the first await so the
+        # original leg's teardown cannot clean up the caller session.
+        self._activate_attended_transfer_answered_channel(caller_id, channel_id)
+
         session = await self.session_store.get_by_call_id(caller_id)
         if not session:
             logger.error("🔀 ATTENDED TRANSFER - Session not found", caller_id=caller_id, channel_id=channel_id)
+            self._unregister_attended_transfer_agent_channel(channel_id)
             await self.ari_client.hangup_channel(channel_id)
             return
 
@@ -8738,11 +8839,9 @@ class Engine:
         attended_cfg = tools_cfg.get("attended_transfer") if isinstance(tools_cfg, dict) else None
         if not isinstance(attended_cfg, dict) or not bool(attended_cfg.get("enabled", False)):
             logger.info("Attended transfer disabled - hanging up agent channel", call_id=caller_id, channel_id=channel_id)
+            self._unregister_attended_transfer_agent_channel(channel_id)
             await self.ari_client.hangup_channel(channel_id)
             return
-
-        # Best-effort: bind agent channel to call for DTMF routing.
-        self.register_attended_transfer_agent_channel(caller_id, channel_id)
 
         # Ensure session state is consistent.
         try:
@@ -10107,6 +10206,14 @@ class Engine:
                 fallback = self._terminal_fallback_tasks.pop(call_id, None)
                 if fallback and not fallback.done():
                     fallback.cancel()
+                deferred_recovery = getattr(
+                    self,
+                    "_deferred_transfer_recovery_tasks",
+                    {},
+                ).pop(call_id, None)
+                if deferred_recovery and not deferred_recovery.done():
+                    deferred_recovery.cancel()
+                self._deferred_transfer_commit_locks.pop(call_id, None)
                 self._terminal_hangup_locks.pop(call_id, None)
                 self._terminal_hangup_started.discard(call_id)
                 self._local_tts_farewell_pending.discard(call_id)
@@ -14700,7 +14807,19 @@ class Engine:
                     try:
                         session = await self.session_store.get_by_call_id(call_id)
                         if session and isinstance(getattr(session, "pending_deferred_transfer", None), dict):
-                            await self._commit_pending_deferred_transfer_for_call(call_id, session)
+                            # Provider callbacks such as Deepgram's receive loop
+                            # are serialized. A timeout recovery may ask that
+                            # same provider to speak and wait for its audio
+                            # events, so the commit/recovery lifecycle must run
+                            # outside this callback.
+                            self._fire_and_forget_for_call(
+                                call_id,
+                                self._commit_pending_deferred_transfer_for_call(
+                                    call_id,
+                                    session,
+                                ),
+                                name=f"deferred-transfer-commit-{call_id}",
+                            )
                             return
                         if session and getattr(session, 'cleanup_after_tts', False):
                             pending = getattr(self, "_local_tts_farewell_pending", set())
@@ -16334,6 +16453,16 @@ class Engine:
                         call_id, session, stage="turn-start"
                     ):
                         return
+                    # Pipeline-authored announcements (for example a deferred
+                    # transfer timeout apology) are persisted outside this
+                    # dialog worker. Rehydrate at every turn boundary so this
+                    # worker cannot send stale context to the LLM and then
+                    # overwrite those messages with its private history copy.
+                    latest_session = await self.session_store.get_by_call_id(call_id)
+                    if latest_session:
+                        conversation_history = list(
+                            latest_session.conversation_history or []
+                        )
                     response_text = ""
                     tool_calls = []
                     _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
@@ -21245,40 +21374,553 @@ class Engine:
         from src.tools.context import ToolExecutionContext
         from src.tools.telephony.deferred_transfer import commit_pending_deferred_transfer
 
-        session = session or await self.session_store.get_by_call_id(call_id)
-        if not session or not isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+        locks = getattr(self, "_deferred_transfer_commit_locks", None)
+        if locks is None:
+            locks = {}
+            self._deferred_transfer_commit_locks = locks
+        lock = locks.setdefault(call_id, asyncio.Lock())
+
+        async with lock:
+            # Always reload under the per-call lock. Provider completion events can
+            # arrive through more than one path, and a stale session object must not
+            # commit an action that was cancelled or replaced while audio drained.
+            session = await self.session_store.get_by_call_id(call_id)
+            action = getattr(session, "pending_deferred_transfer", None) if session else None
+            if (
+                not session
+                or getattr(session, "cleanup_in_progress", False)
+                or getattr(session, "cleanup_completed", False)
+                or not isinstance(action, dict)
+            ):
+                return None
+            action_id = action.get("id")
+
+            local_handoff_played = await self._play_deferred_transfer_local_handoff(call_id, session)
+            if not local_handoff_played:
+                logger.debug("Deferred transfer local handoff skipped", call_id=call_id)
+
+            drained = await self._wait_for_deferred_transfer_audio_drain(call_id)
+            if not drained:
+                return await self._abort_deferred_transfer_after_drain_timeout(
+                    call_id,
+                    action_id=action_id,
+                )
+
+            session = await self.session_store.get_by_call_id(call_id)
+            latest_action = getattr(session, "pending_deferred_transfer", None) if session else None
+            if (
+                not session
+                or getattr(session, "cleanup_in_progress", False)
+                or getattr(session, "cleanup_completed", False)
+                or not isinstance(latest_action, dict)
+                or latest_action.get("id") != action_id
+            ):
+                logger.info(
+                    "Deferred transfer commit skipped because call state changed",
+                    call_id=call_id,
+                    action_id=action_id,
+                    latest_action_id=latest_action.get("id") if isinstance(latest_action, dict) else None,
+                    cleanup_in_progress=getattr(session, "cleanup_in_progress", False) if session else False,
+                    cleanup_completed=getattr(session, "cleanup_completed", False) if session else False,
+                )
+                return None
+
+            provider_name = getattr(session, "provider_name", None) or getattr(self.config, "default_provider", None)
+            context = ToolExecutionContext(
+                call_id=call_id,
+                caller_channel_id=getattr(session, "caller_channel_id", None) or call_id,
+                bridge_id=getattr(session, "bridge_id", None),
+                caller_number=getattr(session, "caller_number", None),
+                called_number=getattr(session, "called_number", None),
+                caller_name=getattr(session, "caller_name", None),
+                context_name=getattr(session, "context_name", None),
+                session_store=self.session_store,
+                ari_client=self.ari_client,
+                config=self._tool_config_for_session(session),
+                tool_registry=self._tool_registry_for_session(session),
+                provider_name=provider_name,
+            )
+            result = await commit_pending_deferred_transfer(context)
+            if result:
+                logger.info(
+                    "Deferred transfer commit result",
+                    call_id=call_id,
+                    status=result.get("status"),
+                    message=result.get("message"),
+                )
+            return result
+
+    async def _abort_deferred_transfer_after_drain_timeout(
+        self,
+        call_id: str,
+        *,
+        action_id: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Cancel the exact pending transfer and return the caller to the AI."""
+        session = await self.session_store.get_by_call_id(call_id)
+        action = getattr(session, "pending_deferred_transfer", None) if session else None
+        if (
+            not session
+            or not isinstance(action, dict)
+            or action.get("id") != action_id
+        ):
+            logger.info(
+                "Deferred transfer timeout ignored because pending action changed",
+                call_id=call_id,
+                action_id=action_id,
+                latest_action_id=action.get("id") if isinstance(action, dict) else None,
+            )
             return None
 
-        local_handoff_played = await self._play_deferred_transfer_local_handoff(call_id, session)
-        if not local_handoff_played:
-            logger.debug("Deferred transfer local handoff skipped", call_id=call_id)
-
-        await self._wait_for_deferred_transfer_audio_drain(call_id)
-
-        provider_name = getattr(session, "provider_name", None) or getattr(self.config, "default_provider", None)
-        context = ToolExecutionContext(
-            call_id=call_id,
-            caller_channel_id=getattr(session, "caller_channel_id", None) or call_id,
-            bridge_id=getattr(session, "bridge_id", None),
-            caller_number=getattr(session, "caller_number", None),
-            called_number=getattr(session, "called_number", None),
-            caller_name=getattr(session, "caller_name", None),
-            context_name=getattr(session, "context_name", None),
-            session_store=self.session_store,
-            ari_client=self.ari_client,
-            config=self._tool_config_for_session(session),
-            tool_registry=self._tool_registry_for_session(session),
-            provider_name=provider_name,
-        )
-        result = await commit_pending_deferred_transfer(context)
-        if result:
-            logger.info(
-                "Deferred transfer commit result",
+        current_action = getattr(session, "current_action", None)
+        predial_channel_id = str(
+            ((action.get("payload") or {}).get("predial") or {}).get("channel_id")
+            or ""
+        ).strip()
+        clear_predial_current_action = False
+        if (
+            isinstance(current_action, dict)
+            and current_action.get("type") == "predial_transfer"
+            and current_action.get("deferred_action_id") == action_id
+        ):
+            predial_channel_id = str(
+                current_action.get("predial_channel_id")
+                or predial_channel_id
+                or ""
+            ).strip()
+            clear_predial_current_action = True
+        if predial_channel_id:
+            # Establish an owner that is independent of the per-call recovery
+            # task before clearing action state or awaiting ARI. If caller
+            # cleanup cancels this task during the first DELETE, the retry owner
+            # still retains and removes the answered destination leg.
+            self._schedule_deferred_predial_forced_hangup_retry(
                 call_id=call_id,
-                status=result.get("status"),
-                message=result.get("message"),
+                channel_id=predial_channel_id,
             )
-        return result
+        if clear_predial_current_action:
+            session.current_action = None
+
+        await self._record_deferred_transfer_timeout_tool_result(session, action)
+
+        # Clear the action before any network or playback awaits. A provider
+        # OutputDone event emitted by the apology must not retry the transfer.
+        session.pending_deferred_transfer = None
+        session.transfer_context = None
+        # Keep capture gated until every caller-facing playback is confirmed
+        # stopped. The normal recovery path restores it immediately before the
+        # apology; a bounded cleanup failure leaves the existing TTS ownership
+        # in control until PlaybackFinished arrives.
+        session.audio_capture_enabled = False
+        await self._save_session(session)
+
+        if predial_channel_id:
+            hangup_accepted = False
+            try:
+                hangup_accepted = bool(
+                    await self.ari_client.hangup_channel(predial_channel_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to hang up deferred transfer predial leg after drain timeout",
+                    call_id=call_id,
+                    action_id=action_id,
+                    predial_channel_id=predial_channel_id,
+                    exc_info=True,
+                )
+            if hangup_accepted:
+                self._release_deferred_predial_hangup_ownership(
+                    predial_channel_id
+                )
+            else:
+                logger.error(
+                    "Deferred transfer predial hangup was not accepted; retaining retry owner",
+                    call_id=call_id,
+                    action_id=action_id,
+                    predial_channel_id=predial_channel_id,
+                )
+            try:
+                await self.ari_client.send_command(
+                    method="DELETE",
+                    resource=f"channels/{session.caller_channel_id}/moh",
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to stop predial MOH after deferred transfer timeout",
+                    call_id=call_id,
+                    exc_info=True,
+                )
+
+        provider = self._call_providers.get(call_id)
+        try:
+            cancel_response = getattr(provider, "cancel_response", None)
+            if callable(cancel_response):
+                await cancel_response()
+            elif isinstance(provider, LocalProvider):
+                await provider.notify_barge_in(call_id, rollback_assistant=True)
+        except Exception:
+            logger.debug(
+                "Failed to cancel provider output after deferred transfer timeout",
+                call_id=call_id,
+                exc_info=True,
+            )
+
+        tools_cfg = (self._tool_config_for_session(session).get("tools") or {})
+        transfer_cfg = tools_cfg.get("transfer", {}) if isinstance(tools_cfg, dict) else {}
+        if not isinstance(transfer_cfg, dict):
+            transfer_cfg = {}
+        apology = str(
+            transfer_cfg.get("deferred_audio_drain_timeout_message")
+            or "I'm sorry, I couldn't complete that transfer without interrupting you. How else can I help?"
+        ).strip()
+
+        stream_stopped = await self._stop_deferred_transfer_stream_before_recovery(
+            call_id
+        )
+        self._provider_stream_queues.pop(call_id, None)
+        self._provider_stream_formats.pop(call_id, None)
+        self._provider_coalesce_buf.pop(call_id, None)
+        self._segment_tts_active.discard(call_id)
+
+        playbacks_stopped = await self._stop_deferred_transfer_playbacks_before_recovery(
+            call_id
+        )
+        if not stream_stopped or not playbacks_stopped:
+            self._schedule_deferred_transfer_timeout_recovery(
+                call_id=call_id,
+                action_id=action_id,
+                predial_channel_id=predial_channel_id,
+                apology=apology,
+            )
+            logger.warning(
+                "Deferred transfer recovery deferred until caller-facing output cleanup is confirmed",
+                call_id=call_id,
+                action_id=action_id,
+                stream_stopped=stream_stopped,
+                playbacks_stopped=playbacks_stopped,
+            )
+            return {
+                "status": "failed",
+                "message": "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
+                "error_code": "deferred_audio_drain_timeout",
+                "transfer_cancelled": True,
+                "apology_spoken": False,
+                "recovery_pending": True,
+            }
+
+        apology_spoken = await self._complete_deferred_transfer_timeout_recovery(
+            call_id=call_id,
+            action_id=action_id,
+            predial_channel_id=predial_channel_id,
+            apology=apology,
+        )
+        return {
+            "status": "failed",
+            "message": "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
+            "error_code": "deferred_audio_drain_timeout",
+            "transfer_cancelled": True,
+            "apology_spoken": bool(apology_spoken),
+        }
+
+    async def _record_deferred_transfer_timeout_tool_result(
+        self,
+        session: CallSession,
+        action: Dict[str, Any],
+    ) -> None:
+        """Append the terminal cancellation to the originating tool history."""
+        origin = action.get("_tool_history_origin")
+        if not isinstance(origin, dict):
+            logger.warning(
+                "Deferred transfer timeout has no originating tool history record",
+                call_id=session.call_id,
+                action_id=action.get("id"),
+            )
+            return
+        tool_call_id = str(origin.get("tool_call_id") or "").strip()
+        tool_name = str(
+            origin.get("name") or action.get("source_tool") or "blind_transfer"
+        ).strip()
+        canonical_name = self._tool_registry_for_session(
+            session
+        ).canonicalize_tool_name(tool_name)
+        if not tool_call_id:
+            return
+        try:
+            created_at = float(action.get("created_at") or time.time())
+        except (TypeError, ValueError):
+            created_at = time.time()
+        await record_in_call_tool_result(
+            session_store=self.session_store,
+            call_id=session.call_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            canonical_name=canonical_name,
+            parameters=dict(origin.get("params") or {}),
+            result={
+                "status": "cancelled",
+                "action": "deferred_transfer_timeout",
+                "message": "Deferred transfer cancelled because caller-facing audio did not drain before the safety timeout.",
+                "error_code": "deferred_audio_drain_timeout",
+                "transfer_cancelled": True,
+                "target": action.get("target"),
+            },
+            duration_ms=max(0.0, (time.time() - created_at) * 1000.0),
+        )
+
+    async def _stop_deferred_transfer_stream_before_recovery(
+        self,
+        call_id: str,
+    ) -> bool:
+        """Stop local streaming and confirm a remote WebSocket flush when required."""
+        requires_remote_confirmation = (
+            str(getattr(self.config, "audio_transport", "") or "").lower()
+            == "websocket"
+        )
+        had_active_stream = False
+        try:
+            stream_info = self.streaming_playback_manager.active_streams.get(call_id)
+            had_active_stream = stream_info is not None
+            if stream_info is not None:
+                stream_info["end_reason"] = "deferred-transfer-drain-timeout"
+            stopped = bool(
+                await self.streaming_playback_manager.stop_streaming_playback(
+                    call_id
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            stopped = False
+            logger.debug(
+                "Failed to flush streaming output after deferred transfer timeout",
+                call_id=call_id,
+                exc_info=True,
+            )
+        if (requires_remote_confirmation or had_active_stream) and not stopped:
+            logger.warning(
+                "Deferred transfer output stop was not confirmed",
+                call_id=call_id,
+                audio_transport=str(
+                    getattr(self.config, "audio_transport", "") or ""
+                ),
+            )
+            return False
+        return True
+
+    async def _complete_deferred_transfer_timeout_recovery(
+        self,
+        *,
+        call_id: str,
+        action_id: Any,
+        predial_channel_id: str,
+        apology: str,
+    ) -> bool:
+        """Restore caller input and speak after output cleanup is confirmed."""
+        current = await self.session_store.get_by_call_id(call_id)
+        if (
+            not current
+            or bool(getattr(current, "cleanup_in_progress", False))
+            or self._session_was_transferred(current)
+        ):
+            return False
+
+        # File and pipeline playback can leave microphone-gating tokens behind
+        # when it is aborted. Release only this call's tokens before asking the
+        # provider to speak the recovery message.
+        try:
+            for token in list(getattr(current, "tts_tokens", set()) or []):
+                try:
+                    if self.conversation_coordinator:
+                        await self.conversation_coordinator.on_tts_end(
+                            call_id,
+                            token,
+                            reason="deferred-transfer-drain-timeout",
+                        )
+                    else:
+                        await self.session_store.clear_gating_token(call_id, token)
+                except Exception:
+                    logger.debug(
+                        "Failed to clear gating token after deferred transfer timeout",
+                        call_id=call_id,
+                        token=token,
+                        exc_info=True,
+                    )
+            current = await self.session_store.get_by_call_id(call_id)
+            if not current or bool(getattr(current, "cleanup_in_progress", False)):
+                return False
+            current.audio_capture_enabled = True
+            await self._save_session(current)
+        except Exception:
+            logger.debug(
+                "Failed to restore audio capture after deferred transfer timeout",
+                call_id=call_id,
+                exc_info=True,
+            )
+
+        apology_spoken = await self._speak_no_input_announcement(
+            call_id,
+            apology,
+            "deferred_transfer_timeout",
+        )
+        logger.warning(
+            "Deferred transfer cancelled after caller-facing audio drain timeout",
+            call_id=call_id,
+            action_id=action_id,
+            predial_channel_id=predial_channel_id or None,
+            apology_spoken=apology_spoken,
+        )
+        return bool(apology_spoken)
+
+    def _schedule_deferred_transfer_timeout_recovery(
+        self,
+        *,
+        call_id: str,
+        action_id: Any,
+        predial_channel_id: str,
+        apology: str,
+    ) -> None:
+        """Retain recovery ownership until output is absent or the call ends."""
+        tasks = getattr(self, "_deferred_transfer_recovery_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._deferred_transfer_recovery_tasks = tasks
+        previous = tasks.get(call_id)
+        if previous and not previous.done():
+            return
+
+        async def _recover() -> None:
+            delay_seconds = 0.5
+            attempt = 0
+            try:
+                while True:
+                    session = await self.session_store.get_by_call_id(call_id)
+                    if (
+                        not session
+                        or bool(getattr(session, "cleanup_in_progress", False))
+                        or self._session_was_transferred(session)
+                    ):
+                        return
+                    attempt += 1
+                    stream_stopped = await self._stop_deferred_transfer_stream_before_recovery(
+                        call_id
+                    )
+                    playbacks_stopped = await self._stop_deferred_transfer_playbacks_before_recovery(
+                        call_id
+                    )
+                    if stream_stopped and playbacks_stopped:
+                        await self._complete_deferred_transfer_timeout_recovery(
+                            call_id=call_id,
+                            action_id=action_id,
+                            predial_channel_id=predial_channel_id,
+                            apology=apology,
+                        )
+                        return
+                    logger.warning(
+                        "Deferred transfer recovery owner is waiting for output cleanup",
+                        call_id=call_id,
+                        action_id=action_id,
+                        attempt=attempt,
+                        stream_stopped=stream_stopped,
+                        playbacks_stopped=playbacks_stopped,
+                        next_retry_seconds=delay_seconds,
+                    )
+                    await asyncio.sleep(delay_seconds)
+                    delay_seconds = min(delay_seconds * 2.0, 5.0)
+            except asyncio.CancelledError:
+                return
+            finally:
+                if tasks.get(call_id) is asyncio.current_task():
+                    tasks.pop(call_id, None)
+
+        task = self._fire_and_forget_for_call(
+            call_id,
+            _recover(),
+            name=f"deferred-transfer-timeout-recovery-{call_id}",
+        )
+        tasks[call_id] = task
+
+    async def _stop_deferred_transfer_playbacks_before_recovery(
+        self,
+        call_id: str,
+    ) -> bool:
+        """Confirm caller-facing ARI playbacks are stopped before apologizing."""
+        retry_delay = 0.1
+        attempt = 0
+        max_attempts = 5
+        while attempt < max_attempts:
+            session = await self.session_store.get_by_call_id(call_id)
+            if not session or bool(getattr(session, "cleanup_in_progress", False)):
+                return False
+            try:
+                playback_ids = await self.session_store.list_playbacks_for_call(
+                    call_id
+                )
+            except Exception:
+                logger.error(
+                    "Failed to enumerate playbacks during deferred transfer recovery",
+                    call_id=call_id,
+                    exc_info=True,
+                )
+                return False
+            if not playback_ids:
+                return True
+
+            attempt += 1
+            rejected = []
+            for playback_id in playback_ids:
+                try:
+                    accepted = bool(
+                        await self.ari_client.stop_playback(playback_id)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    accepted = False
+                    logger.debug(
+                        "Playback stop raised during deferred transfer recovery",
+                        call_id=call_id,
+                        playback_id=playback_id,
+                        attempt=attempt,
+                        exc_info=True,
+                    )
+                if accepted:
+                    # ARI accepted the DELETE (or confirmed 404), so audio can
+                    # no longer overlap recovery speech. Let PlaybackFinished
+                    # clear normal ownership first, then close a stale local
+                    # reference idempotently if that event was missed.
+                    await self.playback_manager.wait_for_playback_end(
+                        call_id,
+                        playback_id,
+                        timeout_sec=0.5,
+                    )
+                    if await self.session_store.get_playback(playback_id):
+                        await self.playback_manager.on_playback_finished(
+                            playback_id
+                        )
+                else:
+                    rejected.append(playback_id)
+
+            if not rejected:
+                continue
+            logger.warning(
+                "Deferred transfer playback stops were not accepted; retaining cleanup ownership",
+                call_id=call_id,
+                playback_ids=rejected,
+                attempt=attempt,
+                next_retry_seconds=(
+                    retry_delay if attempt < max_attempts else None
+                ),
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 1.0)
+
+        logger.error(
+            "Deferred transfer playback stops exhausted retry limit; recovery speech remains suppressed",
+            call_id=call_id,
+            attempts=attempt,
+        )
+        return False
 
     def _deferred_transfer_local_handoff_providers(self, session: Optional[CallSession] = None) -> set[str]:
         tools_cfg = (self._tool_config_for_session(session).get("tools") or {})
@@ -21382,17 +22024,36 @@ class Engine:
             transfer_cfg = {}
 
         try:
-            timeout_sec = float(transfer_cfg.get("deferred_audio_drain_timeout_sec", 5.0))
+            timeout_sec = float(transfer_cfg.get("deferred_audio_drain_timeout_sec", 15.0))
         except (TypeError, ValueError):
-            timeout_sec = 5.0
+            timeout_sec = 15.0
         try:
             quiet_sec = float(transfer_cfg.get("deferred_audio_drain_quiet_ms", 500)) / 1000.0
         except (TypeError, ValueError):
             quiet_sec = 0.5
+        timeout_sec = max(0.0, min(timeout_sec, 30.0))
+        quiet_sec = max(0.0, min(quiet_sec, 5.0))
+        if timeout_sec <= 0.0:
+            snapshot = await self._call_audio_drain_snapshot(call_id)
+            last_real_emit_ts = snapshot.pop("last_real_emit_ts", None)
+            has_pending_audio = any(int(value or 0) > 0 for value in snapshot.values())
+            emit_quiet = (
+                last_real_emit_ts is None
+                or max(0.0, time.time() - float(last_real_emit_ts)) >= quiet_sec
+            )
+            drained = not has_pending_audio and emit_quiet
+            logger.info(
+                "Deferred transfer zero-time audio drain snapshot",
+                call_id=call_id,
+                drained=drained,
+                quiet_ms=int(quiet_sec * 1000),
+                **snapshot,
+            )
+            return drained
         return await self._wait_for_call_audio_drain(
             call_id,
-            timeout_sec=max(0.0, min(timeout_sec, 30.0)),
-            quiet_sec=max(0.0, min(quiet_sec, 5.0)),
+            timeout_sec=timeout_sec,
+            quiet_sec=quiet_sec,
             reason="deferred_transfer",
         )
 

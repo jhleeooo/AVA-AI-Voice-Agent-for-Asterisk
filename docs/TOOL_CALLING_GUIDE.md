@@ -913,6 +913,8 @@ tools:
     technology: "PJSIP"                    # Channel technology for direct extension dialing
     defer_until_playback_complete: true    # Speak handoff text before blind/live/attended transfer actions
     deferred_strategy: "drain_then_dial"   # Or "predial_then_bridge" to dial while handoff audio plays
+    deferred_audio_drain_timeout_sec: 15   # Safety ceiling; timeout cancels the transfer and resumes the AI
+    deferred_audio_drain_quiet_ms: 500     # Require this much quiet after the caller-facing queue drains
     predial_bridge_wait_timeout_sec: 10    # Wait after handoff audio for a predialed destination answer
     predial_timeout_seconds: 30            # Asterisk originate timeout for predialed destination leg
     predial_wait_moh_class: "default"      # MOH class while waiting for predial destination answer
@@ -1346,6 +1348,7 @@ You: "Please transfer me to support"
 Expected: Caller hears MOH while agent is contacted
 Expected: Destination hears announcement + DTMF prompt
 Expected: Agent presses 1 → caller bridged to destination; AI audio removed
+Expected with FreePBX pickup groups: a different group phone may answer the ringing destination with the configured pickup feature code; that pickup phone receives the same announcement and must still press the configured acceptance digit before bridging
 ```
 
 **3. Verify in Logs**:

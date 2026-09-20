@@ -83,6 +83,20 @@ class SessionStore:
 
     async def append_tool_call_if_active(self, call_id: str, record: dict) -> bool:
         """Append history only while the call is registered, under one lock."""
+        return await self.append_tool_call_and_bind_deferred_origin_if_active(
+            call_id,
+            record,
+        )
+
+    async def append_tool_call_and_bind_deferred_origin_if_active(
+        self,
+        call_id: str,
+        record: dict,
+        *,
+        deferred_action_id: str = "",
+        deferred_origin: Optional[dict] = None,
+    ) -> bool:
+        """Append history and bind its deferred action origin atomically."""
         async with self._lock:
             session = self._sessions_by_call_id.get(call_id)
             if session is None:
@@ -90,6 +104,17 @@ class SessionStore:
             if session.tool_calls is None:
                 session.tool_calls = []
             session.tool_calls.append(record)
+            pending = getattr(session, "pending_deferred_transfer", None)
+            if (
+                deferred_action_id
+                and isinstance(deferred_origin, dict)
+                and isinstance(pending, dict)
+                and pending.get("id") == deferred_action_id
+                and not isinstance(pending.get("_tool_history_origin"), dict)
+            ):
+                # Duplicate provider invocations can return the same armed
+                # action. Preserve the first invocation as its history owner.
+                pending["_tool_history_origin"] = dict(deferred_origin)
             return True
 
     async def update_call_metadata(
