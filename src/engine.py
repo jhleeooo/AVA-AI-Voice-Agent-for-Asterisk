@@ -21714,8 +21714,14 @@ class Engine:
         action_id: Any,
         predial_channel_id: str,
         apology: str,
+        speak: bool = True,
     ) -> bool:
-        """Restore caller input and speak after output cleanup is confirmed."""
+        """Restore caller input and speak after output cleanup is confirmed.
+
+        ``speak=False`` only restores caller input (used when cleanup could not
+        be confirmed before the recovery deadline, so speech could overlap
+        still-playing audio but the caller must not be left unheard).
+        """
         current = await self.session_store.get_by_call_id(call_id)
         if (
             not current
@@ -21757,6 +21763,14 @@ class Engine:
                 exc_info=True,
             )
 
+        if not speak:
+            logger.warning(
+                "Deferred transfer recovery restored caller input without speaking",
+                call_id=call_id,
+                action_id=action_id,
+            )
+            return False
+
         apology_spoken = await self._speak_no_input_announcement(
             call_id,
             apology,
@@ -21791,6 +21805,11 @@ class Engine:
         async def _recover() -> None:
             delay_seconds = 0.5
             attempt = 0
+            # Each pass already retries playback stops internally, so bound the
+            # total time we keep the caller's input gated; otherwise a
+            # permanently rejected stop leaves the caller in dead air until
+            # hangup.
+            deadline = time.monotonic() + 30.0
             try:
                 while True:
                     session = await self.session_store.get_by_call_id(call_id)
@@ -21813,6 +21832,21 @@ class Engine:
                             action_id=action_id,
                             predial_channel_id=predial_channel_id,
                             apology=apology,
+                        )
+                        return
+                    if time.monotonic() >= deadline:
+                        logger.error(
+                            "Deferred transfer recovery gave up waiting for output cleanup; restoring caller input without speech",
+                            call_id=call_id,
+                            action_id=action_id,
+                            attempts=attempt,
+                        )
+                        await self._complete_deferred_transfer_timeout_recovery(
+                            call_id=call_id,
+                            action_id=action_id,
+                            predial_channel_id=predial_channel_id,
+                            apology=apology,
+                            speak=False,
                         )
                         return
                     logger.warning(

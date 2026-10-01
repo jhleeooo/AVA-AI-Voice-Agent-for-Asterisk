@@ -1283,6 +1283,55 @@ async def test_deferred_transfer_recovery_owner_retries_until_cleanup_then_apolo
 
 
 @pytest.mark.asyncio
+async def test_deferred_transfer_recovery_owner_gives_up_after_deadline_and_restores_input(monkeypatch):
+    engine = _build_engine({"enabled": True})
+    call_id = "call-deferred-recovery-deadline"
+    session = CallSession(
+        call_id=call_id,
+        caller_channel_id="caller-deferred-recovery-deadline",
+        context_name="support",
+    )
+    await engine.session_store.upsert_call(session)
+
+    clock = {"now": 1000.0}
+    completions = []
+
+    async def fake_stop_stream(target_call_id):
+        return True
+
+    async def fake_stop_playbacks(target_call_id):
+        return False  # ARI keeps rejecting the stop
+
+    async def fake_complete(**kwargs):
+        completions.append(kwargs)
+        return False
+
+    async def fake_sleep(seconds):
+        clock["now"] += 20.0
+
+    monkeypatch.setattr(engine, "_stop_deferred_transfer_stream_before_recovery", fake_stop_stream)
+    monkeypatch.setattr(engine, "_stop_deferred_transfer_playbacks_before_recovery", fake_stop_playbacks)
+    monkeypatch.setattr(engine, "_complete_deferred_transfer_timeout_recovery", fake_complete)
+    monkeypatch.setattr("src.engine.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "src.engine.time",
+        types.SimpleNamespace(time=time.time, monotonic=lambda: clock["now"]),
+    )
+
+    engine._schedule_deferred_transfer_timeout_recovery(
+        call_id=call_id,
+        action_id="action-recovery-deadline",
+        predial_channel_id="",
+        apology="unused",
+    )
+    await engine._deferred_transfer_recovery_tasks[call_id]
+
+    assert len(completions) == 1
+    assert completions[0]["speak"] is False
+    assert engine._deferred_transfer_recovery_tasks == {}
+
+
+@pytest.mark.asyncio
 async def test_deferred_transfer_audio_drain_defaults_to_fifteen_seconds(monkeypatch):
     engine = _build_engine({"enabled": True})
     session = CallSession(call_id="call-default-drain", caller_channel_id="caller-default-drain")
