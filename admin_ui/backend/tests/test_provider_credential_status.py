@@ -239,3 +239,89 @@ async def test_explicit_missing_vertex_path_does_not_fall_back_to_legacy(monkeyp
     assert status["configured"] is False
     assert status["source"] == "configured_file"
     assert status["path"] == str(missing_path)
+
+
+def _authorized_user_payload():
+    """Build ADC-style authorized-user JSON (accepted by google.auth.default only)."""
+    return {
+        "type": "authorized_user",
+        "client_id": "test-client-id",
+        "client_secret": "test-client-secret",
+        "refresh_token": "test-refresh-token",
+    }
+
+
+@pytest.mark.asyncio
+async def test_env_adc_authorized_user_file_is_configured(monkeypatch, tmp_path):
+    """Runtime resolves GOOGLE_APPLICATION_CREDENTIALS via google.auth.default, so
+    any ADC file type it accepts must not be reported as invalid."""
+    adc_path = tmp_path / "adc.json"
+    adc_path.write_text(json.dumps(_authorized_user_payload()), encoding="utf-8")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc_path))
+    monkeypatch.setattr(config_api, "PROVIDER_SECRETS_ROOT", str(tmp_path / "providers"))
+    monkeypatch.setattr(config_api, "VERTEX_CREDENTIALS_PATH", str(tmp_path / "missing-legacy.json"))
+    monkeypatch.setattr(config_api, "_read_merged_config_dict", lambda: _google_provider(use_vertex_ai=True))
+
+    response = await config_api.get_provider_credentials_status("google_live")
+    status = response["credentials"]["vertex-json"]
+
+    assert status["configured"] is True
+    assert status["source"] == "legacy_env_file"
+    assert "test-refresh-token" not in json.dumps(response)
+
+
+@pytest.mark.asyncio
+async def test_explicit_credentials_path_still_requires_service_account(monkeypatch, tmp_path):
+    """An explicit credentials_path is loaded as a service-account key at runtime."""
+    adc_path = tmp_path / "adc.json"
+    adc_path.write_text(json.dumps(_authorized_user_payload()), encoding="utf-8")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setattr(config_api, "PROVIDER_SECRETS_ROOT", str(tmp_path / "providers"))
+    monkeypatch.setattr(config_api, "VERTEX_CREDENTIALS_PATH", str(tmp_path / "missing-legacy.json"))
+    monkeypatch.setattr(
+        config_api,
+        "_read_merged_config_dict",
+        lambda: _google_provider(use_vertex_ai=True, credentials_path=str(adc_path)),
+    )
+
+    response = await config_api.get_provider_credentials_status("google_live")
+    status = response["credentials"]["vertex-json"]
+
+    assert status["configured"] is False
+    assert status["valid"] is False
+
+
+def _elevenlabs_provider(**overrides):
+    provider = {"type": "elevenlabs_agent", "enabled": True}
+    provider.update(overrides)
+    return {"providers": {"elevenlabs_agent": provider}}
+
+
+@pytest.mark.asyncio
+async def test_agent_id_from_env_and_legacy_env_is_configured(monkeypatch, tmp_path):
+    """agent-id status follows the runtime chain, not just an uploaded file."""
+    monkeypatch.setattr(config_api, "PROVIDER_SECRETS_ROOT", str(tmp_path / "providers"))
+    monkeypatch.delenv("ELEVENLABS_AGENT_ID", raising=False)
+    monkeypatch.delenv("MY_AGENT_ID", raising=False)
+
+    monkeypatch.setattr(config_api, "_read_merged_config_dict", lambda: _elevenlabs_provider())
+    status = (await config_api.get_provider_credentials_status("elevenlabs_agent"))["credentials"]["agent-id"]
+    assert status["configured"] is False
+
+    monkeypatch.setenv("MY_AGENT_ID", "agent-from-env")
+    monkeypatch.setattr(
+        config_api, "_read_merged_config_dict", lambda: _elevenlabs_provider(agent_id_env="MY_AGENT_ID")
+    )
+    response = await config_api.get_provider_credentials_status("elevenlabs_agent")
+    status = response["credentials"]["agent-id"]
+    assert status["configured"] is True
+    assert status["source"] == "env_var"
+    assert "agent-from-env" not in json.dumps(response)
+
+    monkeypatch.setenv("ELEVENLABS_AGENT_ID", "legacy-agent")
+    monkeypatch.setattr(config_api, "_read_merged_config_dict", lambda: _elevenlabs_provider())
+    status = (await config_api.get_provider_credentials_status("elevenlabs_agent"))["credentials"]["agent-id"]
+    assert status["configured"] is True
+    assert status["source"] == "legacy_env"

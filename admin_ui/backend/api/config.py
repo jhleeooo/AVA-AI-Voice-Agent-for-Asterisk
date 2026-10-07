@@ -2982,8 +2982,16 @@ def _credential_metadata(provider_key: str, credential_name: str) -> Dict[str, A
     return meta
 
 
-def _configured_file_metadata(path: str, credential_name: str) -> Dict[str, Any]:
-    """Return secret-safe metadata for an operator-configured credential file."""
+def _configured_file_metadata(
+    path: str, credential_name: str, *, strict_service_account: bool = True
+) -> Dict[str, Any]:
+    """Return secret-safe metadata for an operator-configured credential file.
+
+    ``strict_service_account`` mirrors the runtime: an explicit provider
+    ``credentials_path`` must be a service-account key, whereas credentials
+    found through ADC (``GOOGLE_APPLICATION_CREDENTIALS`` / shared file) may
+    be any type ``google.auth.default`` accepts (e.g. authorized_user).
+    """
     target = Path(str(path or "").strip())
     meta: Dict[str, Any] = {
         "uploaded": False,
@@ -2997,15 +3005,21 @@ def _configured_file_metadata(path: str, credential_name: str) -> Dict[str, Any]
     meta.update({"filename": target.name, "uploaded_at": stat.st_mtime})
     if credential_name == "vertex-json":
         try:
-            from google.oauth2 import service_account
+            if strict_service_account:
+                from google.oauth2 import service_account
 
-            creds = service_account.Credentials.from_service_account_file(str(target))
+                creds = service_account.Credentials.from_service_account_file(str(target))
+                project_id = creds.project_id
+            else:
+                import google.auth
+
+                creds, project_id = google.auth.load_credentials_from_file(str(target))
             meta.update(
                 {
                     "configured": True,
                     "valid": True,
-                    "project_id": creds.project_id,
-                    "client_email": creds.service_account_email,
+                    "project_id": project_id,
+                    "client_email": getattr(creds, "service_account_email", None),
                 }
             )
         except Exception:
@@ -3112,6 +3126,68 @@ def _api_key_credential_metadata(
     return meta
 
 
+def _agent_id_credential_metadata(
+    provider_key: str, provider_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Describe the effective ElevenLabs agent-id source (file, env, inline, legacy env)."""
+    helpers = _provider_instances_module()
+    meta = _credential_metadata(provider_key, "agent-id")
+    file_path = str(provider_cfg.get("agent_id_file") or "").strip()
+    env_name = str(provider_cfg.get("agent_id_env") or "").strip()
+    literal = str(provider_cfg.get("agent_id") or "").strip()
+    legacy_env_names = ("ELEVENLABS_AGENT_ID",)
+
+    def _resolves(candidate: Dict[str, Any], legacy: tuple[str, ...] = ()) -> bool:
+        return bool(
+            str(
+                helpers["resolve_secret_value"](
+                    candidate,
+                    file_field="agent_id_file",
+                    env_field="agent_id_env",
+                    inline_field="agent_id",
+                    legacy_env_names=legacy,
+                )
+                or ""
+            ).strip()
+        )
+
+    managed_path = str(meta.get("path") or "").strip()
+    file_is_managed = bool(
+        file_path
+        and meta.get("uploaded")
+        and managed_path
+        and os.path.abspath(file_path) == os.path.abspath(managed_path)
+    )
+    if file_path and not file_is_managed:
+        meta = _configured_file_metadata(file_path, "agent-id")
+
+    configured = False
+    source: Optional[str] = None
+    if file_path and _resolves({"agent_id_file": file_path}):
+        configured, source = True, ("managed_file" if file_is_managed else "configured_file")
+        meta["path"] = file_path
+    elif env_name and _resolves({"agent_id_env": env_name}):
+        configured, source = True, "env_var"
+        meta["env_var"] = env_name
+    elif literal and _resolves({"agent_id": literal}):
+        configured, source = True, "inline"
+    elif _resolves({}, legacy_env_names):
+        configured, source = True, "legacy_env"
+        meta["env_var"] = legacy_env_names[0]
+    elif file_path:
+        source = "configured_file"
+        meta["path"] = file_path
+    elif env_name:
+        source = "env_var"
+        meta["env_var"] = env_name
+    elif literal:
+        source = "inline"
+
+    meta["configured"] = configured
+    meta["source"] = source
+    return meta
+
+
 def _vertex_credential_metadata(provider_key: str, provider_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Describe managed or legacy Vertex credentials without copying them."""
     managed = _credential_metadata(provider_key, "vertex-json")
@@ -3145,12 +3221,14 @@ def _vertex_credential_metadata(provider_key: str, provider_cfg: Dict[str, Any])
 
     env_path = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if env_path:
-        meta = _configured_file_metadata(env_path, "vertex-json")
+        meta = _configured_file_metadata(env_path, "vertex-json", strict_service_account=False)
         meta.update({"source": "legacy_env_file", "env_var": "GOOGLE_APPLICATION_CREDENTIALS"})
         return meta
 
     if Path(VERTEX_CREDENTIALS_PATH).is_file():
-        meta = _configured_file_metadata(VERTEX_CREDENTIALS_PATH, "vertex-json")
+        meta = _configured_file_metadata(
+            VERTEX_CREDENTIALS_PATH, "vertex-json", strict_service_account=False
+        )
         meta["source"] = "legacy_shared_file"
         return meta
 
@@ -3304,6 +3382,10 @@ async def get_provider_credentials_status(provider_key: str):
             )
         elif credential_name == "vertex-json":
             credentials[credential_name] = _vertex_credential_metadata(
+                provider_key, provider_cfg
+            )
+        elif credential_name == "agent-id":
+            credentials[credential_name] = _agent_id_credential_metadata(
                 provider_key, provider_cfg
             )
         else:
